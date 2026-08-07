@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 import io
 import json
+from pathlib import Path
 import re
 import time
 from typing import Any
@@ -67,6 +68,7 @@ INTERACTION_TIMEOUT_SECONDS = 90
 SEARCH_SNAPSHOT_TTL_SECONDS = 300.0
 SEARCH_SNAPSHOT_MAX_ENTRIES = 1024
 MAX_DELIVERY_NOTE_LENGTH = 120
+AIOCQHTTP_LOCAL_RECORD_TIMEOUT_SECONDS = 45.0
 # AstrBot's weixin_oc adapter accepts File outbound but ignores Record.
 _VOICE_AS_FILE_PLATFORMS = frozenset({"weixin_oc"})
 _CANONICAL_RECORDING_PREFERENCES = frozenset({"原版", "原唱", "original"})
@@ -1002,20 +1004,89 @@ class ListenMusicPlugin(Star):
                 action is _DeliveryMode.VOICE
                 and platform_name not in _VOICE_AS_FILE_PLATFORMS
             ):
-                try:
-                    component = Record.fromFileSystem(result.media.path)
-                    await event.send(MessageChain([component]))
-                    return
-                except Exception:
+                if platform_name == "aiocqhttp":
+                    if await self._send_aiocqhttp_local_record(
+                        event, result.media.path
+                    ):
+                        return
                     logger.warning(
-                        "listen-music voice delivery failed on %s; falling back to file",
+                        "listen-music local-path voice delivery failed on %s; "
+                        "falling back to file without base64",
                         platform_name,
                     )
+                else:
+                    try:
+                        component = Record.fromFileSystem(result.media.path)
+                        await event.send(MessageChain([component]))
+                        return
+                    except Exception:
+                        logger.warning(
+                            "listen-music voice delivery failed on %s; "
+                            "falling back to file",
+                            platform_name,
+                        )
 
             component = File(name=result.media.filename, file=str(result.media.path))
             await event.send(MessageChain([component]))
         finally:
             await media.release(result.media)
+
+    async def _send_aiocqhttp_local_record(
+        self,
+        event: AstrMessageEvent,
+        media_path: str | Path,
+    ) -> bool:
+        """Send a shared local path without AstrBot's base64 Record conversion.
+
+        Args:
+            event: The aiocqhttp message event used to route the OneBot action.
+            media_path: The audio path shared by AstrBot and NapCat.
+
+        Returns:
+            Whether the local-path voice message was accepted by the adapter.
+        """
+
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return False
+
+        get_group_id = getattr(event, "get_group_id", lambda: "")
+        get_sender_id = getattr(event, "get_sender_id", lambda: "")
+        group_id = str(get_group_id() or "").strip()
+        sender_id = str(get_sender_id() or "").strip()
+        if group_id.isdigit():
+            send_action = getattr(bot, "send_group_msg", None)
+            target_key = "group_id"
+            target_id = int(group_id)
+        elif sender_id.isdigit():
+            send_action = getattr(bot, "send_private_msg", None)
+            target_key = "user_id"
+            target_id = int(sender_id)
+        else:
+            return False
+        if not callable(send_action):
+            return False
+
+        try:
+            path = Path(media_path).resolve(strict=False)
+            message = [
+                {
+                    "type": "record",
+                    "data": {"file": path.as_uri()},
+                }
+            ]
+            params: dict[str, Any] = {target_key: target_id, "message": message}
+            get_self_id = getattr(event, "get_self_id", lambda: "")
+            self_id = str(get_self_id() or "").strip()
+            if self_id:
+                params["self_id"] = self_id
+            await asyncio.wait_for(
+                send_action(**params),
+                timeout=AIOCQHTTP_LOCAL_RECORD_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return False
+        return True
 
     def _register_account_routes(self) -> None:
         prefix = f"/{PLUGIN_NAME}/accounts"

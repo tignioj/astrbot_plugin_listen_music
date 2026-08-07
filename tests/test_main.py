@@ -1329,6 +1329,83 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event.sent), 1)
         self.assertIsInstance(event.sent[0][0], listen_main.File)
 
+    async def test_aiocqhttp_voice_delivery_uses_shared_local_path(self) -> None:
+        released: list[object] = []
+        calls: list[dict[str, object]] = []
+
+        class FakeMedia:
+            async def release(self, media):
+                released.append(media)
+
+        class FakeBot:
+            async def send_group_msg(self, **kwargs):
+                calls.append(kwargs)
+
+        media_result = types.SimpleNamespace(
+            path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
+        )
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._media = FakeMedia()
+        event = _SendingEvent("chat-a", platform_name="aiocqhttp")
+        event.bot = FakeBot()
+        event.get_group_id = lambda: "437128666"
+        event.get_sender_id = lambda: "859897994"
+        event.get_self_id = lambda: "3075191043"
+        result = types.SimpleNamespace(media=media_result)
+
+        await plugin._send_delivery(event, result, listen_main._DeliveryMode.VOICE)
+
+        self.assertEqual(released, [media_result])
+        self.assertEqual(event.sent, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["group_id"], 437128666)
+        self.assertEqual(calls[0]["self_id"], "3075191043")
+        message = calls[0]["message"]
+        self.assertEqual(message[0]["type"], "record")
+        self.assertEqual(
+            message[0]["data"]["file"],
+            media_result.path.resolve(strict=False).as_uri(),
+        )
+
+    async def test_aiocqhttp_path_failure_falls_back_without_record_base64(
+        self,
+    ) -> None:
+        released: list[object] = []
+
+        class FakeMedia:
+            async def release(self, media):
+                released.append(media)
+
+        class FailingBot:
+            async def send_group_msg(self, **_kwargs):
+                raise RuntimeError("local path rejected")
+
+        media_result = types.SimpleNamespace(
+            path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
+        )
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._media = FakeMedia()
+        event = _SendingEvent("chat-a", platform_name="aiocqhttp")
+        event.bot = FailingBot()
+        event.get_group_id = lambda: "437128666"
+        event.get_sender_id = lambda: "859897994"
+        event.get_self_id = lambda: "3075191043"
+        result = types.SimpleNamespace(media=media_result)
+        original = listen_main.Record.fromFileSystem
+
+        def record_must_not_be_created(_path):
+            raise AssertionError("aiocqhttp fallback must not use base64 Record")
+
+        listen_main.Record.fromFileSystem = staticmethod(record_must_not_be_created)
+        try:
+            await plugin._send_delivery(event, result, listen_main._DeliveryMode.VOICE)
+        finally:
+            listen_main.Record.fromFileSystem = staticmethod(original)
+
+        self.assertEqual(released, [media_result])
+        self.assertEqual(len(event.sent), 1)
+        self.assertIsInstance(event.sent[0][0], listen_main.File)
+
     def test_selection_parser_and_filter_share_one_grammar(self) -> None:
         expected = listen_main._DeliveryMode
         self.assertEqual(listen_main._parse_selection("第2首"), (2, expected.VOICE))
