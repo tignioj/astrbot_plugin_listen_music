@@ -857,6 +857,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(reference)
         assert reference is not None
         self.assertEqual(reference.bvid, "BV1Q541167Qg")
+        self.assertEqual(
+            search.calls[0]["result_limit"], listen_main.MANUAL_SEARCH_LIMIT
+        )
         await plugin._cancel_selection_wait("chat-a")
 
     async def test_search_song_uses_the_same_selection_session(self) -> None:
@@ -1422,7 +1425,11 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             listen_main._parse_selection("选第十首 下载"), (10, expected.DOWNLOAD)
         )
-        self.assertIsNone(listen_main._parse_selection("第11首"))
+        self.assertEqual(listen_main._parse_selection("第11首"), (11, expected.VOICE))
+        self.assertEqual(
+            listen_main._parse_selection("48 下载"), (48, expected.DOWNLOAD)
+        )
+        self.assertIsNone(listen_main._parse_selection("第49首"))
         self.assertIsNone(listen_main._parse_selection("选第十一首"))
         self.assertIsNone(listen_main._parse_selection("下载第2首 听"))
         self.assertIsNone(listen_main._parse_selection("我觉得第二首不错"))
@@ -1432,8 +1439,62 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
             selection_filter.filter(_Event("chat-a", "第2首 下载")), "chat-a"
         )
         self.assertEqual(selection_filter.filter(_Event("chat-a", "取消")), "chat-a")
+        self.assertEqual(selection_filter.filter(_Event("chat-a", "下一页")), "chat-a")
         self.assertEqual(selection_filter.filter(_Event("chat-a", "下载晴天")), "")
         self.assertEqual(selection_filter.filter(_Event("chat-b", "1")), "")
+
+    async def test_manual_search_can_page_forward_and_backward(self) -> None:
+        snapshot = _Snapshot(
+            tuple(
+                _Candidate(f"BV1fixture:{position}", f"候选 {position}")
+                for position in range(1, 6)
+            )
+        )
+
+        class FakeSearch:
+            def snapshot(self, **_kwargs):
+                return snapshot
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._config = {"search_page_size": 2}
+        plugin._search = FakeSearch()
+        controller = listen_main.SessionController()
+        selection = listen_main._SelectionWait(controller, asyncio.Event())
+
+        next_reply = _SendingEvent("chat-a", "下一页")
+        await plugin._deliver_selection(
+            controller, next_reply, snapshot, selection=selection
+        )
+
+        self.assertFalse(controller.stopped)
+        self.assertEqual(selection.page, 2)
+        self.assertIn("第 2/3 页", next_reply.sent[0][1])
+        self.assertIn("3. 候选 3", next_reply.sent[0][1])
+        self.assertNotIn("1. 候选 1", next_reply.sent[0][1])
+
+        previous_reply = _SendingEvent("chat-a", "上一页")
+        await plugin._deliver_selection(
+            controller, previous_reply, snapshot, selection=selection
+        )
+
+        self.assertFalse(controller.stopped)
+        self.assertEqual(selection.page, 1)
+        self.assertIn("第 1/3 页", previous_reply.sent[0][1])
+
+    def test_search_page_size_defaults_and_stays_in_supported_range(self) -> None:
+        configured = listen_main.ListenMusicPlugin(
+            types.SimpleNamespace(), {"search_page_size": 3}
+        )
+        self.assertEqual(configured._search_page_size(), 3)
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        self.assertEqual(plugin._search_page_size(), 10)
+        plugin._config = {"search_page_size": 0}
+        self.assertEqual(plugin._search_page_size(), 1)
+        plugin._config = {"search_page_size": 1000}
+        self.assertEqual(plugin._search_page_size(), listen_main.MANUAL_SEARCH_LIMIT)
+        plugin._config = {"search_page_size": "invalid"}
+        self.assertEqual(plugin._search_page_size(), 10)
 
     def test_discard_wait_filter_is_pure_and_ignores_selection_replies(self) -> None:
         selection_filter = listen_main._SelectionSessionFilter("chat-a")

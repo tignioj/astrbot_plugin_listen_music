@@ -30,6 +30,7 @@ from .selection import SearchSnapshotStore
 
 
 SEARCH_LIMIT = 10
+MANUAL_SEARCH_LIMIT = 48
 BILIBILI_VIDEO_LIMIT = 12
 BILIBILI_DETAIL_CONCURRENCY = 4
 BILIBILI_PAGE_LIMIT = 48
@@ -98,6 +99,7 @@ class SearchService:
         song_title: str | None = None,
         video_ref: BilibiliVideoRef | None = None,
         max_duration_ms: int | None = None,
+        result_limit: int = SEARCH_LIMIT,
     ) -> SearchSnapshot:
         """Search Bilibili and retain a session-bound candidate set.
 
@@ -113,16 +115,33 @@ class SearchService:
         ``video_ref`` is an exact video-level reference parsed from user input.
         It bypasses keyword recall but still expands to page-level candidates,
         so a download can never skip the normal snapshot and user selection.
+
+        Args:
+            session_id: Chat session which owns the resulting snapshot.
+            query: User-visible search request.
+            song_title: Optional structured title for fallback recall.
+            video_ref: Optional exact Bilibili video reference.
+            max_duration_ms: Optional maximum candidate duration.
+            result_limit: Maximum candidates retained in the snapshot.
+
+        Returns:
+            A session-bound snapshot of deliverable candidates.
+
+        Raises:
+            MusicSearchError: If the source fails or has no candidates.
+            ValueError: If the session ID or result limit is invalid.
         """
 
         if not session_id.strip():
             raise ValueError("session_id must not be blank")
 
+        result_limit = max(1, min(int(result_limit), MANUAL_SEARCH_LIMIT))
         if video_ref is None:
             requested_query, candidates = await self._filtered_candidates(
                 query,
                 song_title=song_title,
                 max_duration_ms=max_duration_ms,
+                result_limit=result_limit,
             )
         else:
             requested_query = _video_ref_label(video_ref)
@@ -131,7 +150,7 @@ class SearchService:
                     video_ref,
                     max_duration_ms=max_duration_ms,
                 ),
-                limit=SEARCH_LIMIT,
+                limit=result_limit,
                 max_duration_ms=max_duration_ms,
             )
             if not candidates:
@@ -148,6 +167,7 @@ class SearchService:
         *,
         song_title: str | None,
         max_duration_ms: int | None,
+        result_limit: int,
     ) -> tuple[str, tuple[BilibiliCandidate, ...]]:
         requested_query = _normalize_query(query)
         api_query = prepare_bilibili_search_query(requested_query)
@@ -158,20 +178,22 @@ class SearchService:
             api_query,
             song_title=song_title,
             max_duration_ms=max_duration_ms,
+            result_limit=result_limit,
         )
         filtered = filter_bilibili_candidates(
             candidates,
-            limit=SEARCH_LIMIT,
+            limit=result_limit,
             max_duration_ms=max_duration_ms,
         )
 
         fallback_query = _song_title_fallback_query(song_title, api_query)
-        if len(filtered) < SEARCH_LIMIT and fallback_query is not None:
+        if len(filtered) < result_limit and fallback_query is not None:
             try:
                 fallback_candidates = await self._search_candidates(
                     fallback_query,
                     song_title=song_title,
                     max_duration_ms=max_duration_ms,
+                    result_limit=result_limit,
                 )
             except MusicSearchError:
                 # The second query improves recall only; a source failure must
@@ -181,6 +203,7 @@ class SearchService:
                 filtered,
                 fallback_candidates,
                 max_duration_ms=max_duration_ms,
+                limit=result_limit,
             )
         if not filtered:
             raise MusicSearchError(f"没有找到“{requested_query}”的可播放 Bilibili 音乐")
@@ -197,11 +220,12 @@ class SearchService:
         *,
         song_title: str | None,
         max_duration_ms: int | None,
+        result_limit: int,
     ) -> tuple[BilibiliCandidate, ...]:
         try:
             videos = await self._bilibili.search_videos(
                 api_query,
-                limit=BILIBILI_VIDEO_LIMIT,
+                limit=max(BILIBILI_VIDEO_LIMIT, result_limit),
             )
         except Exception as exc:
             raise MusicSearchError("Bilibili 搜索暂时不可用，请稍后重试") from exc
@@ -308,11 +332,32 @@ class DeliveryService:
         return DeliveryResult(candidate=candidate, media=media)
 
 
-def format_search_results(snapshot: SearchSnapshot) -> str:
-    """Produce the only user-visible catalogue rendering used by command flow."""
+def format_search_results(
+    snapshot: SearchSnapshot,
+    *,
+    page: int = 1,
+    page_size: int = SEARCH_LIMIT,
+) -> str:
+    """Produce the paged catalogue rendering used by command flow.
 
-    lines = [f"Bilibili 搜索结果：{snapshot.query}"]
-    for position, candidate in enumerate(snapshot.candidates, start=1):
+    Args:
+        snapshot: Candidate snapshot to render.
+        page: One-based page number.
+        page_size: Maximum candidates shown on one page.
+
+    Returns:
+        User-visible plain text with absolute candidate positions.
+    """
+
+    page_size = max(1, int(page_size))
+    page_count = max(1, (len(snapshot.candidates) + page_size - 1) // page_size)
+    page = max(1, min(int(page), page_count))
+    start = (page - 1) * page_size
+    end = min(start + page_size, len(snapshot.candidates))
+    lines = [f"Bilibili 搜索结果：{snapshot.query}（第 {page}/{page_count} 页）"]
+    for position, candidate in enumerate(
+        snapshot.candidates[start:end], start=start + 1
+    ):
         download_only = (
             "，仅可下载"
             if _duration_exceeds_limit(candidate.duration_ms, VOICE_MEDIA_LIMITS)
@@ -328,6 +373,8 @@ def format_search_results(snapshot: SearchSnapshot) -> str:
             "下载：回复“序号 下载”",
         )
     )
+    if page_count > 1:
+        lines.append("翻页：回复“下一页”或“上一页”")
 
     return "\n".join(lines)
 
@@ -426,12 +473,13 @@ def _merge_candidates(
     fallback: Sequence[BilibiliCandidate],
     *,
     max_duration_ms: int | None,
+    limit: int = SEARCH_LIMIT,
 ) -> tuple[BilibiliCandidate, ...]:
     """Preserve primary ordering while deduplicating a bounded recall fallback."""
 
     return filter_bilibili_candidates(
         (*primary, *fallback),
-        limit=SEARCH_LIMIT,
+        limit=limit,
         max_duration_ms=max_duration_ms,
     )
 
@@ -548,6 +596,7 @@ __all__ = [
     "DeliveryService",
     "MusicCandidateSummary",
     "MusicSearchError",
+    "MANUAL_SEARCH_LIMIT",
     "SEARCH_LIMIT",
     "SearchService",
     "format_search_results",

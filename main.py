@@ -52,6 +52,7 @@ from .core.media import (
 from .core.models import BilibiliCandidate, SearchSnapshot
 from .core.selection import SearchSnapshotStore
 from .core.services import (
+    MANUAL_SEARCH_LIMIT,
     SEARCH_LIMIT,
     DeliveryError,
     DeliveryResult,
@@ -73,15 +74,11 @@ AIOCQHTTP_LOCAL_RECORD_TIMEOUT_SECONDS = 45.0
 _VOICE_AS_FILE_PLATFORMS = frozenset({"weixin_oc"})
 _CANONICAL_RECORDING_PREFERENCES = frozenset({"原版", "原唱", "original"})
 _CHINESE_SELECTION_POSITIONS = tuple("一二三四五六七八九十")
-if SEARCH_LIMIT > len(_CHINESE_SELECTION_POSITIONS):
-    raise RuntimeError("selection grammar needs more Chinese position names")
 _SELECTION_POSITION_MAP = {
-    **{str(position): position for position in range(1, SEARCH_LIMIT + 1)},
+    **{str(position): position for position in range(1, MANUAL_SEARCH_LIMIT + 1)},
     **{
         character: position
-        for position, character in enumerate(
-            _CHINESE_SELECTION_POSITIONS[:SEARCH_LIMIT], start=1
-        )
+        for position, character in enumerate(_CHINESE_SELECTION_POSITIONS, start=1)
     },
 }
 _SELECTION_POSITION_PATTERN = "|".join(
@@ -243,6 +240,7 @@ class _SelectionWait:
     finished: asyncio.Event
     task: asyncio.Task[None] | None = None
     cancelled: bool = False
+    page: int = 1
 
 
 @dataclass(slots=True)
@@ -428,6 +426,7 @@ class ListenMusicPlugin(Star):
 
     def __init__(self, context: Context, config: dict[str, Any] | None = None) -> None:
         super().__init__(context, config)
+        self._config = config if config is not None else {}
         self._http: aiohttp.ClientSession | None = None
         self._accounts: AccountService | None = None
         self._bilibili: BilibiliClient | None = None
@@ -544,6 +543,7 @@ class ListenMusicPlugin(Star):
                 session_id=session_id,
                 query=query,
                 video_ref=parse_bilibili_video_ref(query),
+                result_limit=MANUAL_SEARCH_LIMIT,
             )
         except MusicSearchError as exc:
             yield event.plain_result(str(exc))
@@ -559,7 +559,9 @@ class ListenMusicPlugin(Star):
             yield event.plain_result("插件正在停止，无法继续选歌。")
             event.stop_event()
             return
-        yield event.plain_result(format_search_results(snapshot))
+        yield event.plain_result(
+            format_search_results(snapshot, page_size=self._search_page_size())
+        )
         event.stop_event()
 
     async def present_music_search_for_llm(
@@ -590,7 +592,13 @@ class ListenMusicPlugin(Star):
                 await self._send_llm_tool_failure(event, "插件正在停止，无法继续选歌。")
                 return None
             try:
-                await event.send(event.plain_result(format_search_results(snapshot)))
+                await event.send(
+                    event.plain_result(
+                        format_search_results(
+                            snapshot, page_size=self._search_page_size()
+                        )
+                    )
+                )
             except Exception:
                 await self._cancel_selection_wait(event.unified_msg_origin)
                 raise
@@ -809,7 +817,9 @@ class ListenMusicPlugin(Star):
         async def select_song(
             controller: SessionController, reply: AstrMessageEvent
         ) -> None:
-            await self._deliver_selection(controller, reply, snapshot)
+            await self._deliver_selection(
+                controller, reply, snapshot, selection=selection
+            )
 
         try:
             await waiter.register_wait(select_song, timeout=INTERACTION_TIMEOUT_SECONDS)
@@ -838,13 +848,48 @@ class ListenMusicPlugin(Star):
         controller: SessionController,
         reply: AstrMessageEvent,
         snapshot: SearchSnapshot,
+        *,
+        selection: _SelectionWait | None = None,
     ) -> None:
         """Resolve the next real user reply against its original snapshot."""
 
         stop_wait = True
         try:
-            if " ".join(reply.message_str.split()) == "取消":
+            message = " ".join(reply.message_str.split())
+            if message == "取消":
                 await reply.send(reply.plain_result("已取消选歌。"))
+                return
+            if message in {"下一页", "下页", "上一页", "上页"}:
+                current = self._require_search().snapshot(
+                    search_id=snapshot.search_id,
+                    session_id=reply.unified_msg_origin,
+                )
+                if current is None:
+                    await reply.send(reply.plain_result("搜索结果已过期，请重新搜索。"))
+                    return
+                page_size = self._search_page_size()
+                page_count = max(
+                    1, (len(current.candidates) + page_size - 1) // page_size
+                )
+                active_page = selection.page if selection is not None else 1
+                delta = 1 if message in {"下一页", "下页"} else -1
+                target_page = active_page + delta
+                if not 1 <= target_page <= page_count:
+                    boundary = "已经是最后一页。" if delta > 0 else "已经是第一页。"
+                    await reply.send(reply.plain_result(boundary))
+                else:
+                    if selection is not None:
+                        selection.page = target_page
+                    await reply.send(
+                        reply.plain_result(
+                            format_search_results(
+                                current,
+                                page=target_page,
+                                page_size=page_size,
+                            )
+                        )
+                    )
+                stop_wait = False
                 return
             parsed = _parse_selection(reply.message_str)
             if parsed is None:
@@ -1263,6 +1308,26 @@ class ListenMusicPlugin(Star):
             raise RuntimeError("plugin is not initialized")
         return self._search
 
+    def _search_page_size(self) -> int:
+        """Read the Dashboard-managed page size with a safe legacy fallback.
+
+        Returns:
+            A page size bounded by the manual candidate limit.
+        """
+
+        config = getattr(self, "_config", None)
+        raw_value = (
+            config.get("search_page_size", SEARCH_LIMIT)
+            if hasattr(config, "get")
+            else SEARCH_LIMIT
+        )
+        if isinstance(raw_value, bool):
+            return SEARCH_LIMIT
+        try:
+            return max(1, min(int(raw_value), MANUAL_SEARCH_LIMIT))
+        except (TypeError, ValueError):
+            return SEARCH_LIMIT
+
     def _require_delivery(self) -> DeliveryService:
         if self._delivery is None:
             raise RuntimeError("plugin is not initialized")
@@ -1289,7 +1354,17 @@ def _parse_selection(message: str) -> tuple[int, _DeliveryMode] | None:
 
 
 def _is_selection_reply(message: str) -> bool:
-    return message == "取消" or _parse_selection(message) is not None
+    return (
+        message
+        in {
+            "取消",
+            "下一页",
+            "下页",
+            "上一页",
+            "上页",
+        }
+        or _parse_selection(message) is not None
+    )
 
 
 def _selection_mode_from_word(word: str) -> _DeliveryMode:

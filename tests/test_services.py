@@ -225,6 +225,24 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bilibili.search_queries, ["晴天"])
         self.assertEqual(bilibili.resolve_calls, [])
 
+    async def test_manual_search_can_retain_more_than_the_default_ten(self) -> None:
+        videos = tuple(video(f"BV{index}") for index in range(1, 13))
+        search, _, _, _ = await self._workflow(videos)
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="晴天",
+            result_limit=12,
+        )
+
+        self.assertEqual(len(snapshot.candidates), 12)
+        page_two = format_search_results(snapshot, page=2, page_size=5)
+        self.assertIn("第 2/3 页", page_two)
+        self.assertIn("6. 周杰伦 - 晴天", page_two)
+        self.assertNotIn("1. 周杰伦 - 晴天", page_two)
+        self.assertIn("下一页", page_two)
+        self.assertIn("上一页", page_two)
+
     async def test_search_strips_original_source_terms_but_keeps_display_query(
         self,
     ) -> None:

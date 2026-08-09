@@ -1,0 +1,8 @@
+{
+  "search_page_size": {
+    "description": "搜索歌曲每页显示数量",
+    "type": "int",
+    "default": 10,
+    "hint": "用户使用 /搜索歌曲 后每页显示的候选数量，支持 1 到 48 条。"
+  }
+}
