@@ -322,6 +322,7 @@ class FindMusicTool(FunctionTool):
             description=(
                 "仅用于直接听歌前的隐藏检索。传入整理后的具体歌名、歌手和版本偏好；"
                 "“唱首歌”时先选定一首再调用。本工具返回当前会话的候选给你判断，"
+                "同一轮调用多次时，每组候选均以各自的 search_id 独立保留。"
                 "不向用户发送候选，也不发送音乐。成功后必须仅从返回的 search_id 和 position 中选择，"
                 "候选评估时，歌名精确或完整匹配优先；用户给出歌手时，以候选标题、搜索标题或分P标题中的歌手线索佐证。"
                 "必须遵守用户明确的版本偏好；未指定版本时，优先普通完整录音，但 Live、翻唱、AI、Remix、DJ、伴奏和 MV 等标签"
@@ -434,7 +435,7 @@ class ListenMusicPlugin(Star):
         self._search: SearchService | None = None
         self._delivery: DeliveryService | None = None
         self._selection_waits: dict[str, _SelectionWait] = {}
-        self._llm_searches: dict[str, _LlmSearch] = {}
+        self._llm_searches: dict[str, list[_LlmSearch]] = {}
         self._selection_lock = asyncio.Lock()
         self._initialized = False
 
@@ -697,10 +698,12 @@ class ListenMusicPlugin(Star):
         return None
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=11)
-    async def discard_llm_search_on_new_message(self, event: AstrMessageEvent) -> None:
-        """A new chat message must not revive a prior hidden model selection."""
+    async def purge_expired_llm_searches_on_new_message(
+        self, _event: AstrMessageEvent
+    ) -> None:
+        """Reclaim expired hidden searches without invalidating live follow-ups."""
 
-        self._clear_llm_search(event.unified_msg_origin)
+        self._purge_expired_llm_searches(time.monotonic())
 
     @filter.custom_filter(_DiscardSelectionWaitFilter)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
@@ -712,7 +715,6 @@ class ListenMusicPlugin(Star):
         if _is_selection_reply(" ".join(event.message_str.split())):
             return
         await self._cancel_selection_wait(event.unified_msg_origin)
-        self._clear_llm_search(event.unified_msg_origin)
 
     async def _send_llm_tool_failure(
         self, event: AstrMessageEvent, message: str
@@ -1209,21 +1211,23 @@ class ListenMusicPlugin(Star):
             self._selection_waits.pop(session_id, None)
 
     def _begin_llm_search(self, session_id: str) -> _LlmSearch:
-        """Replace one chat's hidden search lease without a background cleaner."""
+        """Add one hidden search lease without a background cleaner."""
 
         now = time.monotonic()
         self._purge_expired_llm_searches(now)
-        if (
-            session_id not in self._llm_searches
-            and len(self._llm_searches) >= SEARCH_SNAPSHOT_MAX_ENTRIES
-        ):
-            oldest_session = min(
-                self._llm_searches,
-                key=lambda key: self._llm_searches[key].expires_at,
+        lease_count = sum(len(leases) for leases in self._llm_searches.values())
+        if lease_count >= SEARCH_SNAPSHOT_MAX_ENTRIES:
+            oldest_session, oldest_lease = min(
+                (
+                    (owner_session, lease)
+                    for owner_session, leases in self._llm_searches.items()
+                    for lease in leases
+                ),
+                key=lambda item: item[1].expires_at,
             )
-            self._llm_searches.pop(oldest_session, None)
+            self._discard_llm_search(oldest_session, oldest_lease)
         lease = _LlmSearch(expires_at=now + SEARCH_SNAPSHOT_TTL_SECONDS)
-        self._llm_searches[session_id] = lease
+        self._llm_searches.setdefault(session_id, []).append(lease)
         return lease
 
     def _complete_llm_search(
@@ -1231,49 +1235,58 @@ class ListenMusicPlugin(Star):
     ) -> bool:
         """Publish results only when the request still owns this chat's lease."""
 
-        if self._llm_searches.get(session_id) is not lease:
+        if not any(
+            current is lease for current in self._llm_searches.get(session_id, ())
+        ):
             return False
         lease.search_id = snapshot.search_id
         lease.expires_at = snapshot.expires_at
         return True
 
     def _is_current_llm_search(self, session_id: str, lease: _LlmSearch) -> bool:
-        return self._llm_searches.get(session_id) is lease
+        return any(
+            current is lease for current in self._llm_searches.get(session_id, ())
+        )
 
     def _active_llm_search(self, session_id: str, search_id: str) -> _LlmSearch | None:
         """Return a live exact-match lease without consuming a newer request."""
 
-        lease = self._llm_searches.get(session_id)
-        if lease is None:
+        self._purge_expired_llm_searches(time.monotonic())
+        if not search_id:
             return None
-        if lease.expires_at <= time.monotonic():
-            self._discard_llm_search(session_id, lease)
-            return None
-        if not search_id or lease.search_id != search_id:
-            return None
-        return lease
+        return next(
+            (
+                lease
+                for lease in self._llm_searches.get(session_id, ())
+                if lease.search_id == search_id
+            ),
+            None,
+        )
 
     def _consume_llm_search(self, session_id: str, lease: _LlmSearch) -> bool:
-        if self._llm_searches.get(session_id) is not lease:
+        if not any(
+            current is lease for current in self._llm_searches.get(session_id, ())
+        ):
             return False
-        self._llm_searches.pop(session_id, None)
+        self._discard_llm_search(session_id, lease)
         return True
 
     def _discard_llm_search(self, session_id: str, lease: _LlmSearch) -> None:
-        if self._llm_searches.get(session_id) is lease:
+        leases = self._llm_searches.get(session_id)
+        if leases is None:
+            return
+        leases[:] = [current for current in leases if current is not lease]
+        if not leases:
             self._llm_searches.pop(session_id, None)
 
     def _purge_expired_llm_searches(self, now: float) -> None:
-        expired = [
-            session_id
-            for session_id, lease in self._llm_searches.items()
-            if lease.expires_at <= now
-        ]
-        for session_id in expired:
-            self._llm_searches.pop(session_id, None)
+        for session_id, leases in tuple(self._llm_searches.items()):
+            leases[:] = [lease for lease in leases if lease.expires_at > now]
+            if not leases:
+                self._llm_searches.pop(session_id, None)
 
     def _clear_llm_search(self, session_id: str) -> None:
-        """Forget a model-visible candidate set when its conversation moves on."""
+        """Forget hidden candidates when an explicit visible search takes over."""
 
         searches = getattr(self, "_llm_searches", None)
         if searches is not None:
