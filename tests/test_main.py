@@ -278,15 +278,15 @@ def _configure_selection_waits(plugin: object) -> None:
 
 
 def _set_llm_search(plugin: object, session_id: str, search_id: str) -> None:
-    plugin._llm_searches[session_id] = listen_main._LlmSearch(
-        expires_at=float("inf"), search_id=search_id
+    plugin._llm_searches.setdefault(session_id, []).append(
+        listen_main._LlmSearch(expires_at=float("inf"), search_id=search_id)
     )
 
 
 def _llm_search_ids(plugin: object) -> dict[str, str | None]:
     return {
-        session_id: lease.search_id
-        for session_id, lease in plugin._llm_searches.items()
+        session_id: leases[0].search_id
+        for session_id, leases in plugin._llm_searches.items()
     }
 
 
@@ -466,7 +466,47 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(forbidden, serialized)
 
-    async def test_new_message_cannot_reactivate_a_superseded_hidden_search(
+    async def test_multiple_find_music_calls_keep_each_hidden_snapshot(self) -> None:
+        first_snapshot = _Snapshot((_Candidate("BV1fixture:1", "轻涟"),))
+        second_snapshot = _Snapshot(
+            (_Candidate("BV1fixture:2", "La Chanson de Furina"),)
+        )
+        second_snapshot.search_id = "fixture-search-2"
+
+        class FakeSearch:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+                self.snapshots = iter((first_snapshot, second_snapshot))
+
+            async def search(self, **kwargs):
+                self.calls.append(kwargs)
+                return next(self.snapshots)
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._search = search = FakeSearch()
+        _configure_selection_waits(plugin)
+        event = _SendingEvent("chat-a")
+
+        first = json.loads(await plugin.find_music_for_llm(event, "轻涟"))
+        second = json.loads(
+            await plugin.find_music_for_llm(event, "Furina character demo")
+        )
+
+        self.assertEqual(first["status"], "candidates")
+        self.assertEqual(second["status"], "candidates")
+        self.assertEqual(len(search.calls), 2)
+        first_lease = plugin._active_llm_search("chat-a", first_snapshot.search_id)
+        second_lease = plugin._active_llm_search("chat-a", second_snapshot.search_id)
+        self.assertIsNotNone(first_lease)
+        self.assertIsNotNone(second_lease)
+        self.assertTrue(plugin._consume_llm_search("chat-a", first_lease))
+        self.assertIsNone(plugin._active_llm_search("chat-a", first_snapshot.search_id))
+        self.assertIs(
+            plugin._active_llm_search("chat-a", second_snapshot.search_id),
+            second_lease,
+        )
+
+    async def test_new_message_does_not_invalidate_an_inflight_hidden_search(
         self,
     ) -> None:
         snapshot = _Snapshot((_Candidate("BV1fixture:1", "晴天"),))
@@ -487,13 +527,13 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
 
         pending = asyncio.create_task(plugin.find_music_for_llm(request_event, "晴天"))
         await started.wait()
-        await plugin.discard_llm_search_on_new_message(replacement_event)
+        await plugin.purge_expired_llm_searches_on_new_message(replacement_event)
         finish.set()
 
         result = json.loads(await pending)
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["message"], "歌曲请求已被新的消息替换")
-        self.assertEqual(plugin._llm_searches, {})
+        self.assertEqual(result["status"], "candidates")
+        self.assertEqual(result["search_id"], snapshot.search_id)
+        self.assertEqual(_llm_search_ids(plugin), {"chat-a": snapshot.search_id})
 
     async def test_cancelled_hidden_search_releases_its_lease(self) -> None:
         started = asyncio.Event()
@@ -520,7 +560,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
     def test_hidden_search_leases_are_ttl_and_capacity_bounded(self) -> None:
         plugin = object.__new__(listen_main.ListenMusicPlugin)
         plugin._llm_searches = {
-            "expired": listen_main._LlmSearch(expires_at=0.0, search_id="old")
+            "expired": [listen_main._LlmSearch(expires_at=0.0, search_id="old")]
         }
 
         for index in range(listen_main.SEARCH_SNAPSHOT_MAX_ENTRIES + 1):
@@ -1120,9 +1160,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         plugin._finish_selection_wait("chat-a", selection)
         await discarding
         self.assertEqual(plugin._selection_waits, {})
-        self.assertEqual(plugin._llm_searches, {})
+        self.assertEqual(_llm_search_ids(plugin), {"chat-a": "hidden-search"})
 
-    async def test_new_message_discards_hidden_candidates_without_claiming_event(
+    async def test_new_message_keeps_live_hidden_candidates_without_claiming_event(
         self,
     ) -> None:
         plugin = object.__new__(listen_main.ListenMusicPlugin)
@@ -1130,9 +1170,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         _set_llm_search(plugin, "chat-a", "hidden-search")
         event = _SendingEvent("chat-a", "换一首")
 
-        await plugin.discard_llm_search_on_new_message(event)
+        await plugin.purge_expired_llm_searches_on_new_message(event)
 
-        self.assertEqual(plugin._llm_searches, {})
+        self.assertEqual(_llm_search_ids(plugin), {"chat-a": "hidden-search"})
         self.assertFalse(event.stopped)
         self.assertEqual(event.sent, [])
 
