@@ -134,6 +134,26 @@ def _media_limits_for(action: _DeliveryMode) -> MediaLimits:
     )
 
 
+def _is_indeterminate_telegram_timeout(
+    event: AstrMessageEvent, exc: BaseException
+) -> bool:
+    """Return whether Telegram may have accepted a timed-out send request.
+
+    Telegram can finish delivering an uploaded media file before the Bot API
+    response reaches the client.  Retrying such an indeterminate request can
+    duplicate the media, while reporting it as a definite failure is
+    misleading.
+    """
+
+    if event.get_platform_name() != "telegram":
+        return False
+    return any(
+        cls.__name__ in {"TimedOut", "ReadTimeout"}
+        and cls.__module__.split(".", 1)[0] in {"telegram", "httpx", "httpcore"}
+        for cls in type(exc).__mro__
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _MusicRequest:
     """The structured song identity supplied by one LLM tool call."""
@@ -1066,7 +1086,13 @@ class ListenMusicPlugin(Star):
                         component = Record.fromFileSystem(result.media.path)
                         await event.send(MessageChain([component]))
                         return
-                    except Exception:
+                    except Exception as exc:
+                        if _is_indeterminate_telegram_timeout(event, exc):
+                            logger.warning(
+                                "listen-music Telegram voice delivery confirmation "
+                                "timed out; suppressing duplicate fallback"
+                            )
+                            return
                         logger.warning(
                             "listen-music voice delivery failed on %s; "
                             "falling back to file",
@@ -1074,7 +1100,16 @@ class ListenMusicPlugin(Star):
                         )
 
             component = File(name=result.media.filename, file=str(result.media.path))
-            await event.send(MessageChain([component]))
+            try:
+                await event.send(MessageChain([component]))
+            except Exception as exc:
+                if _is_indeterminate_telegram_timeout(event, exc):
+                    logger.warning(
+                        "listen-music Telegram file delivery confirmation timed out; "
+                        "treating outcome as indeterminate instead of failed"
+                    )
+                    return
+                raise
         finally:
             await media.release(result.media)
 
