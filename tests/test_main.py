@@ -631,6 +631,50 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(released, [media])
 
+    async def test_indeterminate_delivery_retains_hidden_snapshot_for_retry(
+        self,
+    ) -> None:
+        candidate = _Candidate("BV1fixture:1", "温奕心 - 一路生花")
+        snapshot = _Snapshot((candidate,))
+
+        class FakeSearch:
+            def snapshot(self, **_kwargs):
+                return snapshot
+
+        outcomes = [False, True]
+        delivery_calls: list[tuple[object, object, object]] = []
+
+        async def fake_delivery(event, *, candidate, action, preface):
+            delivery_calls.append((event, candidate, action))
+            return outcomes.pop(0)
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._search = FakeSearch()
+        plugin._llm_searches = {}
+        plugin._deliver_with_preface = fake_delivery
+        _set_llm_search(plugin, "chat-a", snapshot.search_id)
+        event = _SendingEvent("chat-a", platform_name="telegram")
+
+        await plugin.deliver_music_for_llm(event, snapshot.search_id, 1)
+
+        lease = plugin._llm_searches["chat-a"][0]
+        self.assertFalse(lease.in_flight)
+        self.assertEqual(lease.search_id, snapshot.search_id)
+        self.assertEqual(
+            event.sent,
+            [
+                (
+                    "plain",
+                    "Telegram 未确认音频是否送达；如果没有收到，请在候选有效期内重试刚才那首。",
+                )
+            ],
+        )
+
+        await plugin.deliver_music_for_llm(event, snapshot.search_id, 1)
+
+        self.assertEqual(plugin._llm_searches, {})
+        self.assertEqual(len(delivery_calls), 2)
+
     async def test_deliver_music_rejects_a_hallucinated_hidden_search_id(self) -> None:
         class FakeSearch:
             def snapshot(self, **_kwargs):
@@ -1371,6 +1415,84 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(released, [media_result])
         self.assertEqual(len(event.sent), 1)
         self.assertIsInstance(event.sent[0][0], listen_main.File)
+
+    async def test_telegram_voice_timeout_does_not_duplicate_with_file_fallback(
+        self,
+    ) -> None:
+        released: list[object] = []
+
+        class FakeMedia:
+            async def release(self, media):
+                released.append(media)
+
+        class TimedOut(Exception):
+            pass
+
+        TimedOut.__module__ = "telegram.error"
+
+        class TimeoutEvent(_SendingEvent):
+            def __init__(self) -> None:
+                super().__init__("chat-a", platform_name="telegram")
+                self.attempts = 0
+
+            async def send(self, _message: object) -> None:
+                self.attempts += 1
+                raise TimedOut("Timed out")
+
+        media_result = types.SimpleNamespace(
+            path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
+        )
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._media = FakeMedia()
+        event = TimeoutEvent()
+        result = types.SimpleNamespace(media=media_result)
+
+        confirmed = await plugin._send_delivery(
+            event, result, listen_main._DeliveryMode.VOICE
+        )
+
+        self.assertFalse(confirmed)
+        self.assertEqual(event.attempts, 1)
+        self.assertEqual(released, [media_result])
+
+    async def test_telegram_file_timeout_is_not_reported_as_definite_failure(
+        self,
+    ) -> None:
+        released: list[object] = []
+
+        class FakeMedia:
+            async def release(self, media):
+                released.append(media)
+
+        class ReadTimeout(Exception):
+            pass
+
+        ReadTimeout.__module__ = "httpx"
+
+        class TimeoutEvent(_SendingEvent):
+            def __init__(self) -> None:
+                super().__init__("chat-a", platform_name="telegram")
+                self.attempts = 0
+
+            async def send(self, _message: object) -> None:
+                self.attempts += 1
+                raise ReadTimeout("Timed out")
+
+        media_result = types.SimpleNamespace(
+            path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
+        )
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._media = FakeMedia()
+        event = TimeoutEvent()
+        result = types.SimpleNamespace(media=media_result)
+
+        confirmed = await plugin._send_delivery(
+            event, result, listen_main._DeliveryMode.DOWNLOAD
+        )
+
+        self.assertFalse(confirmed)
+        self.assertEqual(event.attempts, 1)
+        self.assertEqual(released, [media_result])
 
     async def test_aiocqhttp_voice_delivery_uses_shared_local_path(self) -> None:
         released: list[object] = []

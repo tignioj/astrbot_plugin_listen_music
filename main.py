@@ -134,6 +134,33 @@ def _media_limits_for(action: _DeliveryMode) -> MediaLimits:
     )
 
 
+def _is_indeterminate_telegram_timeout(
+    event: AstrMessageEvent, exc: BaseException
+) -> bool:
+    """Return whether Telegram may have accepted a timed-out send request.
+
+    Telegram can finish delivering an uploaded media file before the Bot API
+    response reaches the client. Retrying such an indeterminate request can
+    duplicate the media, while reporting it as a definite failure is
+    misleading.
+
+    Args:
+        event: The event whose platform receives the outbound media.
+        exc: The exception raised while awaiting the send confirmation.
+
+    Returns:
+        Whether the exception is an indeterminate Telegram transport timeout.
+    """
+
+    if event.get_platform_name() != "telegram":
+        return False
+    return any(
+        cls.__name__ in {"TimedOut", "ReadTimeout"}
+        and cls.__module__.split(".", 1)[0] in {"telegram", "httpx", "httpcore"}
+        for cls in type(exc).__mro__
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _MusicRequest:
     """The structured song identity supplied by one LLM tool call."""
@@ -249,6 +276,7 @@ class _LlmSearch:
 
     expires_at: float
     search_id: str | None = None
+    in_flight: bool = False
 
 
 class _SelectionSessionFilter(SessionFilter):
@@ -355,6 +383,7 @@ class DeliverMusicTool(FunctionTool):
             description=(
                 "仅在 find_music 成功后使用。只能使用其返回的 search_id 和 position，"
                 "发送语音并结束本轮音乐流程。不要用于下载，不要编造序号或 search_id，"
+                "若上一次发送提示 Telegram 结果未确认，可立即用相同参数重试；"
                 "调用前后不要输出过程、解释、确认文字或其他工具调用。"
             ),
             parameters={
@@ -660,12 +689,15 @@ class ListenMusicPlugin(Star):
     ) -> None:
         """Terminally deliver one candidate from the active LLM search snapshot."""
         session_id = event.unified_msg_origin
+        lease: _LlmSearch | None = None
         try:
             normalized_search_id = str(search_id).strip()
             selected_position = _parse_candidate_position(position)
             lease = self._active_llm_search(session_id, normalized_search_id)
             if lease is None:
                 raise DeliveryError("候选已失效，请重新搜索")
+            if lease.in_flight:
+                raise DeliveryError("该候选正在发送，请稍候")
 
             snapshot = self._require_search().snapshot(
                 search_id=normalized_search_id,
@@ -677,22 +709,37 @@ class ListenMusicPlugin(Star):
             candidate = snapshot.candidate_at(selected_position)
             if candidate is None:
                 raise DeliveryError("候选无效或已过期，请重新搜索")
-            if not self._consume_llm_search(session_id, lease):
-                raise DeliveryError("候选已失效，请重新搜索")
-            await self._deliver_with_preface(
+            lease.in_flight = True
+            confirmed = await self._deliver_with_preface(
                 event,
                 candidate=candidate,
                 action=_DeliveryMode.VOICE,
                 preface=_delivery_preface(candidate, _DeliveryMode.VOICE, note),
             )
+            if confirmed:
+                if not self._consume_llm_search(session_id, lease):
+                    logger.warning(
+                        "listen-music confirmed delivery after its candidate lease "
+                        "was replaced"
+                    )
+            else:
+                lease.in_flight = False
+                await self._send_llm_tool_failure(
+                    event,
+                    "Telegram 未确认音频是否送达；如果没有收到，请在候选有效期内重试刚才那首。",
+                )
         except (
             ValueError,
             DeliveryError,
             FfmpegUnavailableError,
             MediaError,
         ) as exc:
+            if lease is not None:
+                lease.in_flight = False
             await self._send_llm_tool_failure(event, str(exc))
         except Exception:
+            if lease is not None:
+                lease.in_flight = False
             logger.exception("listen-music LLM candidate delivery failed")
             await self._send_llm_tool_failure(event, "歌曲发送失败，请稍后重试。")
         return None
@@ -733,7 +780,7 @@ class ListenMusicPlugin(Star):
         candidate: BilibiliCandidate,
         action: _DeliveryMode,
         preface: str,
-    ) -> None:
+    ) -> bool:
         """Overlap a user-visible preface with preparation of the selected media."""
 
         preparation = asyncio.create_task(
@@ -756,7 +803,7 @@ class ListenMusicPlugin(Star):
             if prepared is None:
                 prepared = await preparation
             handed_to_sender = True
-            await self._send_delivery(event, prepared, action)
+            return await self._send_delivery(event, prepared, action)
         except BaseException:
             if not handed_to_sender:
                 await self._discard_delivery_preparation(preparation)
@@ -919,7 +966,19 @@ class ListenMusicPlugin(Star):
                 candidate,
                 limits=_media_limits_for(action),
             )
-            await self._send_delivery(reply, result, action)
+            confirmed = await self._send_delivery(reply, result, action)
+            if not confirmed:
+                stop_wait = False
+                try:
+                    await reply.send(
+                        reply.plain_result(
+                            "Telegram 未确认音频是否送达；如果没有收到，请立即重试相同序号。"
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "listen-music could not send Telegram retry guidance"
+                    )
         except (DeliveryError, FfmpegUnavailableError, MediaError) as exc:
             await reply.send(reply.plain_result(str(exc)))
         except Exception:
@@ -1043,7 +1102,9 @@ class ListenMusicPlugin(Star):
         event: AstrMessageEvent,
         result: DeliveryResult,
         action: _DeliveryMode,
-    ) -> None:
+    ) -> bool:
+        """Send prepared media and report whether the adapter confirmed success."""
+
         media = self._require_media()
         try:
             platform_name = event.get_platform_name()
@@ -1055,7 +1116,7 @@ class ListenMusicPlugin(Star):
                     if await self._send_aiocqhttp_local_record(
                         event, result.media.path
                     ):
-                        return
+                        return True
                     logger.warning(
                         "listen-music local-path voice delivery failed on %s; "
                         "falling back to file without base64",
@@ -1065,8 +1126,15 @@ class ListenMusicPlugin(Star):
                     try:
                         component = Record.fromFileSystem(result.media.path)
                         await event.send(MessageChain([component]))
-                        return
-                    except Exception:
+                        return True
+                    except Exception as exc:
+                        if _is_indeterminate_telegram_timeout(event, exc):
+                            logger.warning(
+                                "listen-music Telegram voice delivery confirmation "
+                                "timed out (%s); suppressing duplicate fallback",
+                                type(exc).__name__,
+                            )
+                            return False
                         logger.warning(
                             "listen-music voice delivery failed on %s; "
                             "falling back to file",
@@ -1074,7 +1142,18 @@ class ListenMusicPlugin(Star):
                         )
 
             component = File(name=result.media.filename, file=str(result.media.path))
-            await event.send(MessageChain([component]))
+            try:
+                await event.send(MessageChain([component]))
+            except Exception as exc:
+                if _is_indeterminate_telegram_timeout(event, exc):
+                    logger.warning(
+                        "listen-music Telegram file delivery confirmation timed out "
+                        "(%s); treating outcome as indeterminate instead of failed",
+                        type(exc).__name__,
+                    )
+                    return False
+                raise
+            return True
         finally:
             await media.release(result.media)
 
