@@ -1416,7 +1416,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event.sent), 1)
         self.assertIsInstance(event.sent[0][0], listen_main.File)
 
-    async def test_telegram_voice_timeout_does_not_duplicate_with_file_fallback(
+    async def test_telegram_voice_delivery_uses_m4a_file_without_trying_record(
         self,
     ) -> None:
         released: list[object] = []
@@ -1425,34 +1425,34 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
             async def release(self, media):
                 released.append(media)
 
-        class TimedOut(Exception):
-            pass
-
-        TimedOut.__module__ = "telegram.error"
-
-        class TimeoutEvent(_SendingEvent):
-            def __init__(self) -> None:
-                super().__init__("chat-a", platform_name="telegram")
-                self.attempts = 0
-
-            async def send(self, _message: object) -> None:
-                self.attempts += 1
-                raise TimedOut("Timed out")
-
         media_result = types.SimpleNamespace(
             path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
         )
         plugin = object.__new__(listen_main.ListenMusicPlugin)
         plugin._media = FakeMedia()
-        event = TimeoutEvent()
+        event = _SendingEvent("chat-a", platform_name="telegram")
         result = types.SimpleNamespace(media=media_result)
+        original = listen_main.Record.fromFileSystem
 
-        confirmed = await plugin._send_delivery(
-            event, result, listen_main._DeliveryMode.VOICE
+        def record_must_not_be_created(_path):
+            raise AssertionError("Telegram must send the M4A as a file")
+
+        listen_main.Record.fromFileSystem = staticmethod(record_must_not_be_created)
+        try:
+            confirmed = await plugin._send_delivery(
+                event, result, listen_main._DeliveryMode.VOICE
+            )
+        finally:
+            listen_main.Record.fromFileSystem = staticmethod(original)
+
+        self.assertTrue(confirmed)
+        self.assertEqual(len(event.sent), 1)
+        component = event.sent[0][0]
+        self.assertIsInstance(component, listen_main.File)
+        self.assertEqual(
+            component.kwargs,
+            {"name": "fixture.m4a", "file": "/tmp/fixture.m4a"},
         )
-
-        self.assertFalse(confirmed)
-        self.assertEqual(event.attempts, 1)
         self.assertEqual(released, [media_result])
 
     async def test_telegram_file_timeout_is_not_reported_as_definite_failure(

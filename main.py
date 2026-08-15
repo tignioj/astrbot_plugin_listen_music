@@ -70,8 +70,10 @@ SEARCH_SNAPSHOT_TTL_SECONDS = 300.0
 SEARCH_SNAPSHOT_MAX_ENTRIES = 1024
 MAX_DELIVERY_NOTE_LENGTH = 120
 AIOCQHTTP_LOCAL_RECORD_TIMEOUT_SECONDS = 45.0
-# AstrBot's weixin_oc adapter accepts File outbound but ignores Record.
-_VOICE_AS_FILE_PLATFORMS = frozenset({"weixin_oc"})
+# AstrBot's weixin_oc adapter ignores Record. Telegram maps Record to
+# sendVoice, so send the prepared M4A as a File there to avoid the OGG/voice
+# delivery timeout path.
+_VOICE_AS_FILE_PLATFORMS = frozenset({"telegram", "weixin_oc"})
 _CANONICAL_RECORDING_PREFERENCES = frozenset({"原版", "原唱", "original"})
 _CHINESE_SELECTION_POSITIONS = tuple("一二三四五六七八九十")
 _SELECTION_POSITION_MAP = {

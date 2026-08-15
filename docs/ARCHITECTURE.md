@@ -116,7 +116,7 @@ NeriPlayer 是本项目的历史参考，不是 Kotlin 代码或策略的移植�
 - DASH 音频必须用 `ffmpeg` 无重编码封装为 M4A；没有 `ffmpeg` 时账户页显示缺失状态，听歌和下载返回清晰错误。
 - 插件启动时，`MediaStore.reclaim_stale()` 在任何交付前清理上次异常退出留下的媒体目录。`MediaStore.prepare()` 为一次交付创建唯一的临时文件，并持有交付名额直到 `_send_delivery()` 的 `finally` 调用 `release()`；慢发送会排队，而不是积累待发送文件。插件停止时取消在途准备并清空媒体目录。没有缓存、共享下载或后台过期任务。
 - DASH 封装时，原始音频与 M4A 会短暂同时存在；两个 100 MiB 下载并发时，媒体目录峰值约为 `400 MiB`。这是传输期间的上界，发送后立即回收，不会随运行时间增长。
-- `weixin_oc` 适配器的出站链支持 `File` 但忽略 `Record`，因此语音听歌会直接交付同一媒体文件；其他平台仍优先语音，适配器明确报错时再回退文件。
+- Telegram 直接用 `File` 交付 M4A，避免 `Record` 对应的 `sendVoice`/OGG 语音路径；`weixin_oc` 适配器也直接使用 `File`。其他平台仍优先语音，适配器明确报错时再回退文件。
 - Bilibili 下载请求使用 Referer、UA 和受控的 Cookie 副本；备用 URL 仅是同一已选音频流的 CDN 备用地址，不能成为换歌机制。
 - Cookie 存在插件数据目录的 `accounts.json`，原子写入且权限为 `0600`。不保存播放历史、收藏或平台写操作。
 
